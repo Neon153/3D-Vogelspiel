@@ -1,0 +1,65 @@
+#version 460
+// sky.comp - physikalisch basierter Himmel (Rayleigh + Mie + Ozon, Einfachstreuung nach Nishita)
+// fuer Sonne UND Mond, als Equirect-Textur. Wird fuer Himmel, Nebel-Farbe und Global Illumination benutzt.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "common.glsl"
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D oSky;
+
+const float Rp = 6360e3, Ra = 6420e3;
+const vec3 bR = vec3(5.8e-6, 13.5e-6, 33.1e-6);
+const float bM = 21e-6;
+const vec3 bO = vec3(0.65e-6, 1.881e-6, 0.085e-6);
+
+vec2 raySphere(vec3 ro, vec3 rd, float R) {
+    float b = dot(ro, rd), c = dot(ro, ro) - R * R, d = b * b - c;
+    if (d < 0.0) return vec2(1e12, -1e12);
+    d = sqrt(d); return vec2(-b - d, -b + d);
+}
+vec3 dens(float h) { return vec3(exp(-h / 8000.0), exp(-h / 1200.0), max(0.0, 1.0 - abs(h - 25000.0) / 15000.0)); }
+
+vec3 scatter(vec3 ro, vec3 rd, vec3 L, float I) {
+    if (I <= 0.0) return vec3(0.0);
+    vec2 ta = raySphere(ro, rd, Ra); float tmax = ta.y;
+    vec2 tp = raySphere(ro, rd, Rp); if (tp.x > 0.0) tmax = min(tmax, tp.x);
+    const int NS = 20, NL = 6;
+    float mu = dot(rd, L);
+    float pR = 3.0 / (16.0 * PI) * (1.0 + mu * mu);
+    float g = 0.76, g2 = g * g;
+    float pM = 3.0 / (8.0 * PI) * ((1.0 - g2) * (1.0 + mu * mu)) / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * mu, 1.5));
+    vec3 od = vec3(0.0), sR = vec3(0.0), sM = vec3(0.0);
+    float tPrev = 0.0;
+    for (int i = 0; i < NS; i++) {
+        // quadratische Verteilung: dichter in Kameranaehe
+        float tNext = tmax * pow(float(i + 1) / float(NS), 2.0);
+        float ds = tNext - tPrev, t = 0.5 * (tNext + tPrev); tPrev = tNext;
+        vec3 p = ro + rd * t; float h = length(p) - Rp;
+        vec3 d = dens(h) * ds; od += d;
+        vec2 tl = raySphere(p, L, Ra); vec2 tg = raySphere(p, L, Rp);
+        if (tg.x > 0.0 && tg.y > 0.0) continue; // im Erdschatten
+        float dl = tl.y / float(NL); vec3 odl = vec3(0.0);
+        for (int j = 0; j < NL; j++) { vec3 q = p + L * (dl * (float(j) + 0.5)); odl += dens(length(q) - Rp) * dl; }
+        vec3 tau = bR * (od.x + odl.x) + bM * 1.1 * (od.y + odl.y) + bO * (od.z + odl.z);
+        vec3 att = exp(-tau);
+        sR += att * d.x; sM += att * d.y;
+    }
+    return I * (sR * bR * pR + sM * bM * pM);
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy); ivec2 sz = imageSize(oSky);
+    if (pix.x >= sz.x || pix.y >= sz.y) return;
+    vec2 uv = (vec2(pix) + 0.5) / vec2(sz);
+    float th = uv.y * PI, ph = (uv.x - 0.5) * 2.0 * PI;
+    vec3 d = vec3(sin(th) * cos(ph), cos(th), sin(th) * sin(ph));
+    float below = clamp(-d.y * 6.0, 0.0, 1.0);
+    d.y = max(d.y, 0.004); d = normalize(d);
+    vec3 ro = vec3(0.0, Rp + 150.0, 0.0);
+    vec3 c = scatter(ro, d, F.sunDir.xyz, F.sky.x);
+    c += scatter(ro, d, F.moonDir.xyz, F.sky.y) * vec3(0.8, 0.9, 1.0);
+    // Mehrfachstreuung (grobe Naeherung) + Nachthimmel-Grundleuchten
+    c *= 1.12;
+    c += vec3(0.00010, 0.00014, 0.00026);
+    c *= mix(1.0, 0.35, below); // unter dem Horizont: abgedunkelter Bodenreflex
+    imageStore(oSky, pix, vec4(c, 1.0));
+}

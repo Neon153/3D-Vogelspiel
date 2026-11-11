@@ -1,0 +1,37 @@
+#version 460
+// atrous.comp - kantenerhaltender A-trous-Wavelet-Filter fuer die indirekte Beleuchtung
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "common.glsl"
+layout(set = 0, binding = 1) uniform sampler2D tIn;
+layout(set = 0, binding = 2) uniform sampler2D tND;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D oOut;
+layout(push_constant) uniform PC { int stepSize; } pc;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy); ivec2 sz = ivec2(F.res.xy);
+    if (pix.x >= sz.x || pix.y >= sz.y) return;
+    vec4 c = texelFetch(tIn, pix, 0); vec4 nd = texelFetch(tND, pix, 0);
+    if (nd.w < 0.5) { imageStore(oOut, pix, c); return; }
+    vec3 n = octDecF(nd.xy);
+    bool foliage = nd.w > 1.5 && nd.w < 2.5;
+    const float kw[3] = float[3](0.375, 0.25, 0.0625);
+    // kurze History -> staerker filtern
+    float lumSig = mix(4.0, 0.6, clamp(c.a / 16.0, 0.0, 1.0));
+    float l0 = luma(c.rgb);
+    vec3 sum = vec3(0.0); float ws = 0.0;
+    for (int y = -2; y <= 2; y++) for (int x = -2; x <= 2; x++) {
+        ivec2 q = pix + ivec2(x, y) * pc.stepSize;
+        if (q.x < 0 || q.y < 0 || q.x >= sz.x || q.y >= sz.y) continue;
+        vec4 qn = texelFetch(tND, q, 0); if (qn.w < 0.5) continue;
+        vec3 qc = texelFetch(tIn, q, 0).rgb;
+        float w = kw[abs(x)] * kw[abs(y)];
+        float dz = abs(qn.z - nd.z) / (nd.z * (foliage ? 0.12 : 0.03) + 0.02);
+        w *= exp(-dz * dz);
+        if (!foliage) w *= pow(max(dot(octDecF(qn.xy), n), 0.0), 24.0);
+        float dl = abs(luma(qc) - l0) / (lumSig * (l0 + 0.05));
+        w *= exp(-dl * dl);
+        sum += qc * w; ws += w;
+    }
+    imageStore(oOut, pix, vec4(ws > 1e-5 ? sum / ws : c.rgb, c.a));
+}

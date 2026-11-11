@@ -1,0 +1,25 @@
+#version 460
+// bloom.comp - Streulicht/Glare: Viertelaufloesung + separierbarer Gauss (mode 0 = verkleinern, 1 = horizontal, 2 = vertikal)
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "common.glsl"
+layout(set = 0, binding = 1) uniform sampler2D tIn;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D oOut;
+layout(push_constant) uniform PC { int mode; } pc;
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy), sz = imageSize(oOut);
+    if (pix.x >= sz.x || pix.y >= sz.y) return;
+    vec2 uv = (vec2(pix) + 0.5) / vec2(sz);
+    vec3 c = vec3(0.0);
+    if (pc.mode == 0) {
+        vec2 t = F.res.zw;
+        c = (textureLod(tIn, uv + t * vec2(-1.0, -1.0), 0.0).rgb + textureLod(tIn, uv + t * vec2(1.0, -1.0), 0.0).rgb + textureLod(tIn, uv + t * vec2(-1.0, 1.0), 0.0).rgb + textureLod(tIn, uv + t * vec2(1.0, 1.0), 0.0).rgb) * 0.25;
+        c = min(c, vec3(400.0));
+    } else {
+        vec2 d = pc.mode == 1 ? vec2(1.0 / float(sz.x), 0.0) : vec2(0.0, 1.0 / float(sz.y));
+        float ws = 0.0;
+        for (int i = -9; i <= 9; i++) { float w = exp(-float(i * i) / 32.0); c += textureLod(tIn, uv + d * float(i), 0.0).rgb * w; ws += w; }
+        c /= ws;
+    }
+    imageStore(oOut, pix, vec4(c, 1.0));
+}

@@ -1,0 +1,7 @@
+# Build-Zwischenstaende und Laufzeitdateien
+build/
+dist/
+out/
+*.o
+*.ppm
+vogelflug.log

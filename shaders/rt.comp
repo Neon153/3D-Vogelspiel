@@ -1,0 +1,596 @@
+#version 460
+// rt.comp - Herzstueck: komplettes Bild per Hardware-Raytracing (VK_KHR_ray_query).
+// Pro Pixel: Primaerstrahl, Schattenstrahl zu Sonne/Mond, 1-Bounce Global Illumination,
+// Spiegelungen (Wasser, Glas, Pfuetzen), volumetrischer Nebel mit Schattenstrahlen.
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "common.glsl"
+
+layout(set = 0, binding = 1) uniform accelerationStructureEXT tlasS; // statische Welt
+layout(set = 0, binding = 2) uniform accelerationStructureEXT tlasB; // Vogel (jedes Frame neu)
+struct Vtx { vec3 p; uint n; vec2 uv; uint col; uint mat; };
+layout(set = 0, binding = 3, std430) readonly buffer VB { Vtx vtx[]; };
+layout(set = 0, binding = 4, std430) readonly buffer IB { uint idx[]; };
+layout(set = 0, binding = 5) uniform sampler2D skyMap;
+layout(set = 0, binding = 6, rgba8) uniform writeonly image2D oAlbedo;
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D oND;
+layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D oDirect;
+layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D oIndirect;
+layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D oSpec;
+layout(set = 0, binding = 11, rgba16f) uniform writeonly image2D oFog;
+layout(set = 0, binding = 12, rgba16f) uniform writeonly image2D oMotion;
+layout(set = 0, binding = 13, std430) readonly buffer BVB { Vtx bvtx[]; }; // Vogel: pro Frame verformtes Netz
+layout(set = 0, binding = 14, std430) readonly buffer BIB { uint bidx[]; };
+
+const uint M_TERRAIN = 0u, M_ROAD = 1u, M_SIDEWALK = 2u, M_FAC_CONCRETE = 3u, M_FAC_BRICK = 4u, M_FAC_GLASS = 5u, M_ROOF = 6u, M_CONCRETE = 7u,
+           M_BARK = 8u, M_LEAF = 9u, M_GRASS = 10u, M_CARPAINT = 11u, M_METAL = 12u, M_WATER = 13u, M_FEATHER = 14u, M_CARGLASS = 15u, M_BEAK = 16u;
+const float CLOUD_H = 1700.0;
+
+// ------------------------------------------------------------------ Zufall
+uint rngState;
+float rnd() { rngState = rngState * 747796405u + 2891336453u; uint w = ((rngState >> ((rngState >> 28u) + 4u)) ^ rngState) * 277803737u; w = (w >> 22u) ^ w; return float(w) * (1.0 / 4294967296.0); }
+
+// ------------------------------------------------------------------ globale Beleuchtungsgroessen
+vec3 gLd, gLc, gAmb; bool gLightOn;
+
+vec3 skyTex(vec3 d) { return textureLod(skyMap, skyUV(d), 0.0).rgb; }
+
+// ------------------------------------------------------------------ Strahlverfolgung
+struct Hit { float t; uint tri; vec2 bc; int inst; int prim; mat4x3 o2w; bool bird; };
+
+// Prozedurale Alpha-Maske der Blattkarten. Jede Karte besteht aus 2 Dreiecken mit festem
+// UV-Layout, daher laesst sich uv ohne Speicherzugriff aus den Baryzentren berechnen.
+bool leafAlpha(uint sbt, int prim, vec2 b, int inst) {
+    uint type = sbt >> 20;
+    vec2 uv = ((prim & 1) == 0) ? vec2(b.x + b.y, b.y) : vec2(b.x, b.x + b.y);
+    uint seed = uint(prim >> 1) * 2654435761u ^ uint(inst) * 40503u;
+    if (type == 2u) { // Nadelzweig
+        float y = abs(uv.y - 0.5), w = 0.5 * (1.0 - uv.x * 0.8);
+        if (y > w) return false;
+        if (y < 0.035) return true;
+        return fract(uv.x * 18.0 - y * 6.0) < 0.55;
+    }
+    float G = type == 3u ? 4.0 : 6.0;
+    vec2 g = uv * G, c = floor(g);
+    uint h = hashu(seed + uint(c.x) + uint(c.y) * 7u);
+    if ((h & 3u) == 0u) return false;
+    vec2 f = g - c - 0.5 - (vec2(float((h >> 11) & 31u), float((h >> 16) & 31u)) / 31.0 - 0.5) * 0.42;
+    float sc = 0.68 + 0.32 * float((h >> 21) & 15u) / 15.0;
+    float a = float((h >> 3) & 255u) * (6.2831853 / 256.0), cs = cos(a), sn = sin(a);
+    vec2 r = vec2(cs * f.x + sn * f.y, -sn * f.x + cs * f.y);
+    float lx = r.x / (0.46 * sc), ly = r.y / (0.3 * sc);
+    return lx * lx + ly * ly * (1.0 + 0.8 * lx) < 1.0;
+}
+
+#define LEAF_LOOP(q) \
+    while (rayQueryProceedEXT(q)) { \
+        if (rayQueryGetIntersectionTypeEXT(q, false) == gl_RayQueryCandidateIntersectionTriangleEXT) { \
+            if (leafAlpha(rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(q, false), rayQueryGetIntersectionPrimitiveIndexEXT(q, false), \
+                          rayQueryGetIntersectionBarycentricsEXT(q, false), rayQueryGetIntersectionInstanceIdEXT(q, false))) \
+                rayQueryConfirmIntersectionEXT(q); \
+        } \
+    }
+
+// mask: 0xFF = alles, 0x01 = ohne Gras-Bueschel (fuer Nebel und indirektes Licht)
+bool occluded(vec3 o, vec3 d, float tmax, uint mask) {
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, tlasS, gl_RayFlagsTerminateOnFirstHitEXT, mask, o, 0.0, d, tmax);
+    LEAF_LOOP(q)
+    return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+bool occludedBird(vec3 o, vec3 d, float tmax) {
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, tlasB, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFFu, o, 0.0, d, tmax);
+    while (rayQueryProceedEXT(q)) {}
+    return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+bool trace(vec3 o, vec3 d, float tmax, bool withBird, uint mask, out Hit h) {
+    bool hit = false;
+    h.t = tmax; h.bird = false; h.tri = 0u; h.bc = vec2(0.0); h.inst = 0; h.prim = 0;
+    {
+        rayQueryEXT q;
+        rayQueryInitializeEXT(q, tlasS, 0u, mask, o, 0.0, d, tmax);
+        LEAF_LOOP(q)
+        if (rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            hit = true;
+            h.t = rayQueryGetIntersectionTEXT(q, true);
+            uint sbt = rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(q, true);
+            h.prim = rayQueryGetIntersectionPrimitiveIndexEXT(q, true);
+            h.tri = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(q, true)) + uint(rayQueryGetIntersectionGeometryIndexEXT(q, true)) * (sbt & 0xFFFFFu) + uint(h.prim);
+            h.bc = rayQueryGetIntersectionBarycentricsEXT(q, true);
+            h.inst = rayQueryGetIntersectionInstanceIdEXT(q, true);
+            h.o2w = rayQueryGetIntersectionObjectToWorldEXT(q, true);
+        }
+    }
+    if (withBird) {
+        rayQueryEXT q;
+        rayQueryInitializeEXT(q, tlasB, gl_RayFlagsOpaqueEXT, 0xFFu, o, 0.0, d, h.t);
+        while (rayQueryProceedEXT(q)) {}
+        if (rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            hit = true; h.bird = true;
+            h.t = rayQueryGetIntersectionTEXT(q, true);
+            h.prim = rayQueryGetIntersectionPrimitiveIndexEXT(q, true);
+            h.tri = uint(h.prim);
+            h.bc = rayQueryGetIntersectionBarycentricsEXT(q, true);
+            h.inst = rayQueryGetIntersectionInstanceIdEXT(q, true);
+            h.o2w = rayQueryGetIntersectionObjectToWorldEXT(q, true);
+        }
+    }
+    return hit;
+}
+bool shadowed(vec3 o, vec3 d) { return occluded(o, d, 4000.0, 0xFFu) || occludedBird(o, d, 200.0); }
+
+// ------------------------------------------------------------------ Wolken, Himmel
+float cloudD(vec2 p, int oct) {
+    p += vec2(F.misc2.w * 0.012, F.misc2.w * 0.004);
+    float w = fbm2(p * 0.35 + vec2(7.0, 3.0), 2);
+    float n = fbm2(p * 0.55 + vec2(w * 1.2), oct);
+    float cov = F.sky.w;
+    return smoothstep(0.74 - cov * 0.55, 1.0 - cov * 0.55, n * 1.25);
+}
+float cloudShadow(vec3 P) {
+    vec3 L = gLd; if (L.y < 0.05) return 1.0;
+    float t = (CLOUD_H - P.y) / L.y;
+    return 1.0 - 0.8 * cloudD((P.xz + L.xz * t) * 0.001, 4) * smoothstep(0.05, 0.2, L.y);
+}
+vec4 clouds(vec3 ro, vec3 rd) {
+    if (rd.y < 0.015) return vec4(0.0);
+    float t = (CLOUD_H - ro.y) / rd.y; vec2 q = (ro.xz + rd.xz * t) * 0.001;
+    float d = cloudD(q, 5); if (d <= 0.002) return vec4(0.0);
+    vec3 L = gLd;
+    float d2 = cloudD(q + L.xz / max(L.y, 0.25) * 0.22, 3);
+    float shade = exp(-d2 * 1.7) * mix(1.0, 0.7, d);
+    float mu = dot(rd, L), silver = pow(max(mu, 0.0), 10.0) * (1.0 - d) * 1.2;
+    vec3 col = gLc * (0.22 + 0.85 * shade + silver) + gAmb * 0.75;
+    float a = (1.0 - exp(-d * 3.5)) * smoothstep(0.015, 0.13, rd.y) * exp(-t / 70000.0);
+    return vec4(col, a);
+}
+vec3 stars(vec3 d) {
+    vec3 p = d * 230.0; ivec3 c = ivec3(floor(p));
+    uint h = hashu(uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u);
+    if ((h & 255u) > 2u) return vec3(0.0);
+    vec3 o = vec3(float((h >> 8) & 255u), float((h >> 16) & 255u), float(h >> 24)) / 255.0 * 0.6 + 0.2;
+    float dist = length(p - (vec3(c) + o));
+    float b = pow(float((h >> 12) & 1023u) / 1023.0, 4.0) * 2.5 + 0.15;
+    vec3 tint = mix(vec3(1.0, 0.85, 0.7), vec3(0.75, 0.85, 1.0), float((h >> 5) & 7u) / 7.0);
+    return tint * b * smoothstep(0.2, 0.04, dist);
+}
+// Himmel inkl. Sonne/Mond/Sterne/Wolken. soft = fuer Spiegelungen (groessere, schwaechere Sonnenscheibe)
+vec3 skyFull(vec3 ro, vec3 rd, bool soft) {
+    vec3 c = skyTex(rd);
+    float cs = dot(rd, F.sunDir.xyz);
+    if (soft) c += F.sunColor.rgb * 9.0 * smoothstep(cos(0.024), cos(0.014), cs);
+    else c += F.sunColor.rgb * 70.0 * smoothstep(cos(0.0088), cos(0.0068), cs);
+    float cm = dot(rd, F.moonDir.xyz);
+    if (cm > 0.999) {
+        vec3 mx = normalize(cross(F.moonDir.xyz, vec3(0.0, 1.0, 0.0))), my = cross(mx, F.moonDir.xyz);
+        vec2 mu = vec2(dot(rd, mx), dot(rd, my)) / 0.0135; float r2 = dot(mu, mu);
+        if (r2 < 1.0) {
+            float mar = fbm2(mu * 1.8 + 5.0, 4);
+            float alb = mix(0.9, 0.42, smoothstep(0.42, 0.62, mar)) * pow(1.0 - r2, 0.18);
+            c += F.moonColor.rgb * 30.0 * alb * smoothstep(1.0, 0.92, r2);
+        }
+    }
+    if (!soft && F.sky.z > 0.001) c += stars(rd) * F.sky.z * smoothstep(0.0, 0.12, rd.y);
+    vec4 cl = clouds(ro, rd);
+    return mix(c, cl.rgb, cl.a);
+}
+
+// ------------------------------------------------------------------ Nebel
+float fogTau(vec3 ro, vec3 rd, float t0, float t1) {
+    float b = F.fog.x, k = F.fog.y;
+    float y0 = max(ro.y + rd.y * t0, -20.0), kd = k * rd.y * (t1 - t0);
+    float f = abs(kd) < 1e-3 ? 1.0 - kd * 0.5 : (1.0 - exp(-kd)) / kd;
+    return b * exp(-k * y0) * (t1 - t0) * f;
+}
+vec3 horizonCol(vec3 rd) { return skyTex(normalize(vec3(rd.x, 0.035 + max(rd.y, 0.0) * 0.4, rd.z))); }
+// Volumetrischer Nebel: im Nahbereich mit Schattenstrahlen (Lichtschaefte), danach analytisch.
+vec4 fogMarch(vec3 ro, vec3 rd, float t, bool isSky, vec3 Hc) {
+    float tn = min(t, F.fog.w); int N = int(F.fog.z);
+    float Tacc = 1.0; vec3 L = vec3(0.0);
+    const float amb = 0.38;
+    float a = 0.0;
+    for (int i = 0; i < N; i++) {
+        float b = tn * pow(float(i + 1) / float(N), 1.5);
+        float tr = exp(-fogTau(ro, rd, a, b));
+        float vis = 1.0;
+        if (gLightOn) { vec3 p = ro + rd * mix(a, b, rnd()); vis = occluded(p, gLd, 1500.0, 1u) ? 0.0 : 1.0; }
+        L += Tacc * (1.0 - tr) * Hc * (amb + (1.0 - amb) * vis);
+        Tacc *= tr; a = b;
+    }
+    if (!isSky && t > tn) { float tr = exp(-fogTau(ro, rd, tn, t)); L += Tacc * (1.0 - tr) * Hc; Tacc *= tr; }
+    return vec4(L, Tacc);
+}
+
+// ------------------------------------------------------------------ Materialien
+struct Surf { vec3 P, N, Ng, alb, stint; float rough, f0, trans; uint id; };
+
+vec3 grassCol(vec2 p) {
+    float n = fbm2(p * 0.35, 3), m = vnoise(p * 0.045 + 3.0);
+    vec3 c = mix(vec3(0.045, 0.075, 0.022), vec3(0.105, 0.135, 0.04), n);
+    c = mix(c, vec3(0.17, 0.155, 0.065), smoothstep(0.55, 0.85, m) * 0.6);
+    return mix(c, vec3(0.06, 0.05, 0.03), smoothstep(0.62, 0.8, vnoise(p * 0.11 + 9.0)) * 0.7);
+}
+
+// Innenraum hinter einem Fenster ("Interior Mapping"): Strahl gegen einen Raum-Quader in Fassadenkoordinaten.
+// p = Eintrittspunkt (m, x entlang der Wand, y Hoehe im Geschoss), v = Blickrichtung (z zeigt ins Gebaeude).
+vec3 interior(vec3 p, vec3 v, float W, float Hh, uint rh) {
+    const float D = 5.5;
+    float tx = v.x > 0.0 ? (W - p.x) / v.x : (v.x < 0.0 ? -p.x / v.x : 1e9);
+    float ty = v.y > 0.0 ? (Hh - p.y) / v.y : (v.y < 0.0 ? -p.y / v.y : 1e9);
+    float tz = D / v.z;
+    float t = min(tx, min(ty, tz)); vec3 q = p + v * t;
+    float r1 = float(rh & 255u) / 255.0, r2 = float((rh >> 8) & 255u) / 255.0;
+    vec3 wallC = mix(mix(vec3(0.5, 0.46, 0.38), vec3(0.36, 0.42, 0.44), r1), vec3(0.45, 0.33, 0.25), r2 * r2);
+    vec3 c;
+    if (t == tz) { // Rueckwand mit offener Tuer und Wasserflecken
+        c = wallC * (0.75 + 0.25 * vnoise(q.xy * 1.3 + r1 * 50.0));
+        if (abs(q.x - W * (0.25 + 0.5 * r2)) < 0.48 && q.y < 2.1) c *= 0.16;
+        c *= mix(1.0, 0.5, smoothstep(0.5, 0.75, vnoise(q.xy * 0.8 + r2 * 31.0)));
+    } else if (t == tx) c = wallC * 0.8 * (0.8 + 0.2 * vnoise(q.zy * 1.5 + r2 * 9.0));
+    else if (v.y > 0.0) { vec2 pf = abs(fract(q.xz / 1.2) - 0.5); c = vec3(0.5, 0.5, 0.48) * mix(0.55, 1.0, step(max(pf.x, pf.y), 0.46)); }
+    else c = mix(vec3(0.13, 0.1, 0.075), vec3(0.2, 0.19, 0.17), r1) * (0.55 + 0.7 * vnoise(q.xz * 2.0 + r1 * 13.0));
+    return c * (0.08 + 0.62 * exp(-q.z * 0.32));
+}
+
+Surf evalSurface(Hit h, vec3 ro, vec3 rd, bool detail) {
+    Surf s;
+    Vtx a, b, c;
+    if (h.bird) { a = bvtx[bidx[3u * h.tri]]; b = bvtx[bidx[3u * h.tri + 1u]]; c = bvtx[bidx[3u * h.tri + 2u]]; }
+    else { a = vtx[idx[3u * h.tri]]; b = vtx[idx[3u * h.tri + 1u]]; c = vtx[idx[3u * h.tri + 2u]]; }
+    vec3 w = vec3(1.0 - h.bc.x - h.bc.y, h.bc.x, h.bc.y);
+    vec2 uv = a.uv * w.x + b.uv * w.y + c.uv * w.z;
+    vec3 n = octDec(a.n) * w.x + octDec(b.n) * w.y + octDec(c.n) * w.z;
+    vec3 ng = cross(b.p - a.p, c.p - a.p);
+    mat3 m = mat3(h.o2w);
+    n = normalize(m * n); ng = normalize(m * ng);
+    if (dot(ng, rd) > 0.0) ng = -ng;
+    if (dot(n, rd) > 0.0) n = -n;
+    vec4 col = unpackUnorm4x8(a.col) * w.x + unpackUnorm4x8(b.col) * w.y + unpackUnorm4x8(c.col) * w.z;
+    col.rgb *= col.rgb;
+    uint mat = a.mat, id = mat & 255u;
+    s.P = ro + rd * h.t; s.N = n; s.Ng = ng; s.id = id; s.alb = col.rgb; s.rough = 0.9; s.f0 = 0.04; s.trans = 0.0; s.stint = vec3(1.0);
+    vec3 P = s.P; vec2 p = P.xz;
+    float dist = h.t;
+
+    if (id == M_TERRAIN) {
+        float nz = fbm2(p * 0.25, detail ? 4 : 2), big = vnoise(p * 0.02 + 3.3);
+        vec3 al = col.rgb * (0.62 + 0.75 * nz) * mix(0.85, 1.2, big);
+        al = mix(al, al * vec3(1.55, 1.25, 0.6), smoothstep(0.55, 0.8, vnoise(p * 0.07 + 11.0)) * 0.5);
+        float sl = 1.0 - n.y;
+        al = mix(al, vec3(0.15, 0.14, 0.13) * (0.6 + 0.8 * nz), smoothstep(0.22, 0.42, sl));
+        float wl = F.misc2.x;
+        al = mix(al, vec3(0.15, 0.125, 0.085) * (0.7 + 0.5 * nz), smoothstep(wl + 1.2, wl + 0.2, P.y));
+        s.alb = al; s.rough = 0.95;
+        if (detail && dist < 250.0) s.N = normalize(n + 0.22 * vec3(vnoise(p * 1.7) - 0.5, 0.0, vnoise(p * 1.7 + 5.0) - 0.5));
+    } else if (id == M_ROAD || id == M_SIDEWALK || id == M_ROOF) {
+        float n1 = fbm2(p * 0.9, 3);
+        vec3 al;
+        float og, crack = 0.0;
+        if (id == M_ROAD) {
+            float n2 = detail ? vnoise(p * 7.0) : 0.5;
+            al = (vec3(0.05) + 0.03 * n1 + 0.014 * n2) * vec3(1.0, 0.98, 0.95);
+            if (detail) {
+                float cr = abs(fbm2(p * 0.22 + 31.7, 4) - 0.47);
+                crack = 1.0 - smoothstep(0.003, 0.016, cr);
+                float hw = float((mat >> 16) & 255u) * 0.25;
+                float mk = (abs(uv.x) < 0.09 && fract(uv.y / 8.0) < 0.45) ? 1.0 : 0.0;
+                if (abs(abs(uv.x) - hw + 0.7) < 0.07) mk = 1.0;
+                mk *= smoothstep(0.35, 0.6, vnoise(p * 0.6 + 7.0) + n2 * 0.2) * clamp(1.5 - dist / 200.0, 0.0, 1.0);
+                al = mix(al, vec3(0.42, 0.4, 0.34), mk * 0.75);
+            }
+            og = overgrow(p) * 0.8;
+        } else if (id == M_SIDEWALK) {
+            al = vec3(0.24, 0.235, 0.22) * (0.7 + 0.5 * n1);
+            if (detail && dist < 150.0) { vec2 tf = abs(fract(p / 2.0) - 0.5); al *= mix(0.72, 1.0, step(max(tf.x, tf.y), 0.485)); }
+            if (detail) { float cr = abs(fbm2(p * 0.3 + 11.7, 3) - 0.45); crack = 1.0 - smoothstep(0.003, 0.014, cr); }
+            og = min(overgrow(p) + 0.12, 1.0);
+        } else {
+            al = col.rgb * (0.7 + 0.6 * n1);
+            og = clamp(float(mat >> 24) / 255.0 * 0.9 + 0.05, 0.0, 1.0) * smoothstep(0.3, 0.6, fbm2(p * 0.06 + 3.0, 3) + 0.15);
+        }
+        float g = smoothstep(0.45, 0.8, og + (n1 - 0.45) * 0.55 + crack * 0.35);
+        al = mix(al, vec3(0.022), crack * 0.7);
+        vec3 veg = mix(vec3(0.07, 0.058, 0.035), grassCol(p), smoothstep(0.3, 0.7, g));
+        al = mix(al, veg, g);
+        s.rough = mix(0.85, 0.95, g);
+        if (n.y > 0.9) {
+            float pd = smoothstep(0.6, 0.66, fbm2(p * 0.06 + 91.3, 3)) * (1.0 - g);
+            if (pd > 0.0) { al *= mix(1.0, 0.4, pd); s.rough = mix(s.rough, 0.035, pd); s.f0 = mix(0.04, 0.025, pd); s.N = normalize(mix(n, vec3(0.0, 1.0, 0.0), pd)); }
+        }
+        s.alb = al;
+    } else if (id == M_FAC_CONCRETE || id == M_FAC_BRICK || id == M_FAC_GLASS) {
+        float seed = float((mat >> 8) & 255u); uint pB = (mat >> 16) & 255u; float level = float(mat >> 24) / 255.0;
+        bool glassT = (id == M_FAC_GLASS);
+        float bay = glassT ? 1.5 + 0.3 * float(pB & 3u) : 2.4 + 0.5 * float(pB & 3u);
+        float fh = 3.0 + 0.3 * float((pB >> 2) & 3u);
+        vec2 cell = vec2(uv.x / bay, uv.y / fh), cid = floor(cell), f = cell - cid;
+        uint hh = hashu(uint(int(cid.x)) * 7919u ^ hashu(uint(int(cid.y)) + uint(seed) * 131u));
+        uint bh = hashu(uint(seed) * 2246822519u + 77u); // pro Gebaeude
+        float wr = float(hh & 1023u) / 1023.0, wr2 = float((hh >> 10) & 1023u) / 1023.0;
+        bool ground = cid.y < 0.5;
+        vec2 lo, hi;
+        if (glassT) { lo = vec2(0.035, 0.0); hi = vec2(0.965, ground ? 0.9 : 0.74); }
+        else if (ground) { lo = vec2(0.1, 0.02); hi = vec2(0.9, 0.78); }
+        else if (id == M_FAC_BRICK) { lo = vec2(0.27, 0.3); hi = vec2(0.73, 0.82); }
+        else { lo = vec2(0.13, 0.28); hi = vec2(0.87, 0.84); }
+        float n1 = fbm2(uv * 0.35 + seed, 3);
+        vec3 wc = col.rgb * (0.72 + 0.5 * n1);
+        if (glassT) wc = col.rgb * 0.5 * (0.8 + 0.4 * n1);
+        else if (id == M_FAC_CONCRETE) wc *= 0.9 + 0.2 * float((hh >> 20) & 15u) / 15.0; // Ton der einzelnen Fertigteilplatten
+        if (detail) {
+            float streak = fbm2(vec2(uv.x * 1.3 + seed * 3.0, uv.y * 0.07), 3);
+            wc *= mix(1.0, 0.5, smoothstep(0.42, 0.72, streak) * 0.8);
+            float fade = clamp(1.0 - dist / 90.0, 0.0, 1.0);
+            if (id == M_FAC_BRICK && fade > 0.0) {
+                vec2 bb = vec2(uv.x / 0.5, uv.y / 0.16); bb.x += 0.5 * floor(bb.y); vec2 bf = fract(bb);
+                float mort = clamp(step(bf.x, 0.06) + step(bf.y, 0.14), 0.0, 1.0);
+                wc = mix(wc, wc * 0.55 + 0.04, mort * fade * 0.7);
+                wc *= mix(1.0, 0.8 + 0.4 * hash2i(ivec2(floor(bb))), fade);
+            } else if (id == M_FAC_CONCRETE) {
+                float jx = min(f.x, 1.0 - f.x) * bay, jy = min(f.y, 1.0 - f.y) * fh;
+                wc *= mix(0.65, 1.0, smoothstep(0.0, 0.06, min(jx, jy)) * fade + (1.0 - fade));
+            }
+        }
+        s.alb = wc; s.rough = 0.9;
+        vec3 tintB = col.rgb / max(max(col.r, max(col.g, col.b)), 1e-3);
+        if (glassT) { s.rough = 0.1; s.f0 = 0.07; s.stint = mix(vec3(1.0), tintB, 0.4); } // Bruestung: hinterlackiertes Glas spiegelt ebenfalls
+        // Tangentenraum der Wand: T entlang u, Hochachse, v.z zeigt ins Gebaeude
+        vec3 T = normalize(cross(vec3(0.0, 1.0, 0.0), n) + vec3(1e-5, 0.0, 0.0));
+        vec3 v = vec3(dot(rd, T), rd.y, max(-dot(rd, n), 0.04));
+        bool hole = false, glass = false;
+        vec2 wq = (f - lo) / (hi - lo);
+        if (wq.x > 0.0 && wq.y > 0.0 && wq.x < 1.0 && wq.y < 1.0) {
+            vec2 sz = (hi - lo) * vec2(bay, fh), pm = wq * sz;
+            // Die Scheibe sitzt zurueckversetzt in der Wand -> Parallaxe, sichtbare Laibung
+            float inset = glassT ? 0.07 : (id == M_FAC_BRICK ? 0.24 : 0.17);
+            vec2 g = pm + v.xy / v.z * inset;
+            if (g.x < 0.0 || g.y < 0.0 || g.x > sz.x || g.y > sz.y) {
+                float tx = v.x > 0.0 ? (sz.x - pm.x) / v.x : (v.x < 0.0 ? -pm.x / v.x : 1e9);
+                float ty = v.y > 0.0 ? (sz.y - pm.y) / v.y : (v.y < 0.0 ? -pm.y / v.y : 1e9);
+                s.N = tx < ty ? -sign(v.x) * T : vec3(0.0, -sign(v.y), 0.0); // Laibung, Sturz oder Fensterbank mit eigener Normalen
+                s.alb = glassT ? vec3(0.055) : (id == M_FAC_BRICK ? mix(wc, vec3(0.3, 0.29, 0.27), 0.6) : wc) * 0.9;
+                s.rough = glassT ? 0.5 : 0.9; s.f0 = 0.04; s.stint = vec3(1.0);
+            } else {
+                vec2 gq = g / sz;
+                float frame = min(min(g.x, sz.x - g.x), min(g.y, sz.y - g.y));
+                bool isFrame = frame < 0.06;
+                if (!glassT && !ground) isFrame = isFrame || abs(g.x - sz.x * 0.5) < 0.028 || abs(g.y - sz.y * 0.64) < 0.026; // Sprossen
+                if (!glassT && ground) isFrame = isFrame || abs(fract(g.x / 1.1) - 0.5) > 0.475;
+                float brokenP = ground ? 0.7 : (glassT ? mix(0.07, 0.28, level) : mix(0.2, 0.48, level));
+                bool broken = wr < brokenP;
+                float shard = vnoise(gq * vec2(3.0, 4.0) + vec2(wr * 40.0, wr2 * 40.0));
+                hole = broken && (shard > 0.22 + 0.5 * wr2);
+                if (isFrame) { s.alb = ((bh >> 3) & 3u) == 0u ? vec3(0.3, 0.29, 0.27) : vec3(0.045, 0.045, 0.05); s.rough = 0.5; s.f0 = 0.04; s.stint = vec3(1.0); hole = false; }
+                else {
+                    vec3 room = vec3(0.035);
+                    if (detail && dist < 600.0) {
+                        float span = glassT ? 3.0 : 1.0; // Glastuerme: Raeume ueber drei Achsen
+                        float cx = glassT ? mod(cid.x, span) : 0.0;
+                        uint rh = hashu(uint(int(floor(cid.x / span))) * 31337u ^ hashu(uint(int(cid.y)) * 7u + uint(seed) * 977u));
+                        room = interior(vec3((cx + lo.x) * bay + g.x, lo.y * fh + g.y, 0.0), v, bay * span, fh, rh);
+                    }
+                    if (hole) { s.alb = room; s.rough = 1.0; s.f0 = 0.0; s.stint = vec3(1.0); }
+                    else {
+                        glass = true;
+                        float dirt = fbm2(gq * 3.0 + wr * 20.0, 2);
+                        vec3 behind = room;
+                        if (!glassT && wr2 > 0.72) behind = vec3(0.2, 0.185, 0.15) * (0.55 + 0.45 * smoothstep(0.25, 0.4, abs(fract(g.y * 7.0 + wr) - 0.5))) * step(g.y / sz.y, 0.35 + 0.65 * wr); // Jalousie, teils halb heruntergelassen
+                        if (!glassT && wr2 > 0.72 && g.y / sz.y > 0.35 + 0.65 * wr) behind = room;
+                        vec3 gt = glassT ? mix(vec3(0.8), tintB, 0.55) * 0.6 : vec3(0.82);
+                        s.alb = behind * gt + vec3(0.05, 0.045, 0.035) * dirt * 0.5;
+                        // Spiegelung: beschichtetes Fassadenglas reflektiert deutlich staerker als einfaches Fensterglas
+                        float coat = float((bh >> 8) & 255u) / 255.0;
+                        s.f0 = glassT ? 0.10 + 0.16 * coat : 0.075;
+                        if ((hh & 31u) == 0u) s.f0 = 0.045; // nachtraeglich ersetzte, unbeschichtete Scheibe
+                        s.rough = 0.02 + 0.06 * dirt;
+                        s.stint = glassT ? mix(vec3(1.0), tintB, 0.5) : vec3(1.0);
+                        // jede Scheibe ist leicht verkippt und gewoelbt -> lebendige, unruhige Spiegelbilder
+                        vec2 pc = gq - 0.5;
+                        float bow = (float((hh >> 5) & 31u) / 31.0 - 0.5) * (glassT ? 0.075 : 0.045);
+                        s.N = normalize(n + T * (pc.x * bow + (wr - 0.5) * 0.03) + vec3(0.0, 1.0, 0.0) * (pc.y * bow + (wr2 - 0.5) * 0.03));
+                    }
+                }
+                if (!glassT) s.alb *= mix(0.5, 1.0, smoothstep(0.0, 0.3, sz.y - g.y)); // Schatten unter dem Sturz
+            }
+        }
+        if (!hole) {
+            float iv = ivyMask(uv.x, uv.y, seed, level);
+            float moss = smoothstep(0.4, 0.8, iv * 0.95 + (n1 - 0.45) * 0.9) * (glass ? 0.6 : 1.0);
+            vec3 mossC = mix(vec3(0.04, 0.052, 0.02), vec3(0.02, 0.036, 0.015), n1 * 1.6);
+            s.alb = mix(s.alb, mossC, moss * 0.9); s.rough = mix(s.rough, 0.95, smoothstep(0.1, 0.5, moss));
+            if (moss > 0.4) { s.N = n; s.stint = vec3(1.0); }
+        }
+    } else if (id == M_CONCRETE) {
+        float n1 = fbm2(P.xz * 0.5 + P.y * 0.37, 3);
+        vec3 al = col.rgb * (0.65 + 0.6 * n1);
+        if (((mat >> 16) & 255u) == 1u && detail) { float fl = fract(uv.y / 3.3); al *= mix(0.5, 1.0, smoothstep(0.0, 0.08, min(fl, 1.0 - fl) * 3.3 - 0.1)); }
+        float moss = smoothstep(0.55, 0.8, fbm2(P.xz * 0.11 + P.y * 0.05, 3) + n.y * 0.2);
+        s.alb = mix(al, vec3(0.045, 0.062, 0.025), moss * 0.7); s.rough = 0.92;
+    } else if (id == M_BARK) {
+        float n1 = fbm2(vec2(uv.x * 9.0, uv.y * 1.2), 3);
+        s.alb = col.rgb * (0.55 + 0.9 * n1);
+        s.alb = mix(s.alb, vec3(0.05, 0.075, 0.025), smoothstep(0.5, 0.75, vnoise(P.xz * 0.7 + P.y * 0.3)) * 0.6);
+        s.rough = 0.95;
+    } else if (id == M_LEAF) {
+        float hv = hash1(uint(h.prim >> 1) * 7u + uint(h.inst) * 13u), ti = hash1(uint(h.inst) * 2654435761u);
+        s.alb = col.rgb * (0.75 + 0.5 * hv) * mix(vec3(0.85, 0.95, 0.85), vec3(1.3, 1.12, 0.7), ti * ti);
+        s.rough = 0.55; s.trans = 1.0;
+    } else if (id == M_GRASS) {
+        float ti = hash1(uint(h.inst) * 2654435761u);
+        s.alb = col.rgb * mix(vec3(0.85, 0.95, 0.8), vec3(1.35, 1.15, 0.65), ti * ti); s.rough = 0.7; s.trans = 0.6;
+    } else if (id == M_CARPAINT) {
+        uint ch = hashu(uint(h.inst) * 977u + 5u);
+        vec3 pal[6] = vec3[6](vec3(0.35, 0.04, 0.03), vec3(0.04, 0.09, 0.22), vec3(0.3, 0.3, 0.29), vec3(0.03, 0.03, 0.035), vec3(0.4, 0.33, 0.1), vec3(0.06, 0.16, 0.1));
+        vec3 paint = pal[ch % 6u];
+        float r1 = fbm2(P.xz * 1.6 + P.y * 2.1 + float(ch & 255u), 3);
+        float rust = smoothstep(0.38, 0.62, r1 + (1.0 - n.y) * 0.05);
+        s.alb = mix(paint, vec3(0.16, 0.065, 0.03) * (0.6 + 0.8 * r1), rust);
+        s.rough = mix(0.32, 0.9, rust); s.f0 = 0.05;
+        float moss = smoothstep(0.6, 0.8, vnoise(P.xz * 0.9 + 3.0)) * smoothstep(0.5, 0.9, n.y);
+        s.alb = mix(s.alb, vec3(0.05, 0.075, 0.03), moss); s.rough = mix(s.rough, 0.95, moss);
+    } else if (id == M_METAL) {
+        float r1 = fbm2(P.xz * 1.1 + P.y * 0.9, 3);
+        uint mk = (mat >> 8) & 255u;
+        s.alb = mix(col.rgb, vec3(0.15, 0.065, 0.03), smoothstep(0.45, 0.7, r1) * (mk == 0u ? 0.8 : 0.0));
+        s.rough = 0.6;
+        if (mk == 2u) { s.rough = 0.3 + 0.2 * r1; s.f0 = 0.45; s.alb = col.rgb * (0.5 + 0.3 * r1); } // eloxiertes Aluminium
+    } else if (id == M_WATER) {
+        s.alb = vec3(0.012, 0.03, 0.025); s.rough = 0.05; s.f0 = 0.02; s.N = vec3(0.0, 1.0, 0.0);
+    } else if (id == M_FEATHER) {
+        // feine Federstrahlen quer zur Spannweite + leichte Fleckung (uv = Ruhepose in Metern)
+        float barb = 0.88 + 0.12 * sin(uv.x * 420.0 + sin(uv.y * 37.0) * 1.5);
+        s.alb = col.rgb * barb * (0.82 + 0.36 * vnoise(uv * 70.0)); s.rough = 0.62;
+    } else if (id == M_CARGLASS) {
+        float dirt = fbm2(P.xz * 2.0 + P.y, 2);
+        s.alb = vec3(0.02) + vec3(0.06, 0.055, 0.04) * dirt; s.rough = 0.05 + 0.25 * dirt; s.f0 = 0.06;
+    } else if (id == M_BEAK) {
+        s.rough = ((mat >> 8) & 255u) == 1u ? 0.08 : 0.4; s.f0 = 0.05;
+    }
+    return s;
+}
+
+// Direkte Beleuchtung eines Treffers (fuer GI-/Spiegelstrahlen): Sonne/Mond mit Schatten + Himmelsanteil
+vec3 shadeSimple(Surf s, float t) {
+    float ndl = dot(s.N, gLd);
+    float dif = s.trans > 0.0 ? max((ndl + 0.3) / 1.3, 0.0) + max(-ndl, 0.0) * 0.3 : max(ndl, 0.0);
+    vec3 L = gAmb * 0.45;
+    if (gLightOn && dif > 0.0) {
+        vec3 o = s.trans > 0.0 ? s.P + gLd * 0.05 : s.P + s.Ng * (0.02 + t * 0.0005);
+        if (!occluded(o, gLd, 4000.0, 1u)) L += gLc * dif * cloudShadow(s.P);
+    }
+    return s.alb * L;
+}
+// Radianz entlang eines Spiegelstrahls
+vec3 traceRadiance(vec3 o, vec3 d) {
+    Hit h;
+    if (!trace(o, d, 6000.0, true, 0xFFu, h)) return skyFull(o, d, true);
+    Surf s = evalSurface(h, o, d, false);
+    vec3 L = shadeSimple(s, h.t);
+    float T = exp(-fogTau(o, d, 0.0, h.t));
+    return mix(horizonCol(d), L, T);
+}
+float wh(vec2 p) {
+    float t = F.camPos.w;
+    return vnoise(p * 0.11 + vec2(t * 0.09, t * 0.04)) * 1.5 + vnoise(p * 0.37 - vec2(t * 0.14, -t * 0.1)) * 0.5 + vnoise(p * 1.25 + vec2(t * 0.3, t * 0.22)) * 0.1;
+}
+vec3 cosDir(vec3 n) {
+    float r1 = rnd(), r2 = rnd(); float ph = 6.2831853 * r1, r = sqrt(r2);
+    vec3 t = normalize(abs(n.y) < 0.99 ? cross(n, vec3(0.0, 1.0, 0.0)) : cross(n, vec3(1.0, 0.0, 0.0))), b = cross(n, t);
+    return normalize(t * (r * cos(ph)) + b * (r * sin(ph)) + n * sqrt(max(1.0 - r2, 0.0)));
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= int(F.res.x) || pix.y >= int(F.res.y)) return;
+    rngState = hashu(uint(pix.x) + uint(pix.y) * 8191u) ^ hashu(uint(F.misc.x) * 9781u + 17u);
+    vec2 uv = (vec2(pix) + 0.5 + F.jitter.xy) * F.res.zw, ndc = uv * 2.0 - 1.0;
+    vec2 uvC = (vec2(pix) + 0.5) * F.res.zw;
+    vec3 ro = F.camPos.xyz, rd = normalize(F.camFwd.xyz + ndc.x * F.camRight.xyz - ndc.y * F.camUp.xyz);
+
+    gLightOn = F.lightColor.w > 0.5; gLc = F.lightColor.rgb;
+    { // Lichtrichtung im Kegel der Sonnen-/Mondscheibe streuen -> weiche Schatten
+        vec3 L = F.lightDir.xyz; float r = F.lightDir.w * sqrt(rnd()), ph = 6.2831853 * rnd();
+        vec3 t = normalize(cross(L, vec3(0.0, 1.0, 0.0))), b = cross(L, t);
+        gLd = normalize(L + (t * cos(ph) + b * sin(ph)) * r);
+    }
+    gAmb = (skyTex(vec3(0.0, 1.0, 0.0)) + skyTex(normalize(vec3(1.0, 0.35, 0.0))) + skyTex(normalize(vec3(-1.0, 0.35, 0.0))) + skyTex(normalize(vec3(0.0, 0.35, 1.0))) + skyTex(normalize(vec3(0.0, 0.35, -1.0)))) * 0.2;
+    vec3 Hc = horizonCol(rd);
+
+    Hit h;
+    bool hit = trace(ro, rd, 30000.0, true, 0xFFu, h);
+    if (!hit) {
+        vec3 sky = skyFull(ro, rd, false);
+        vec4 fg = fogMarch(ro, rd, 1e9, true, Hc);
+        vec2 puv = projPrev(F.pCamPos.xyz + rd * 1000.0);
+        imageStore(oAlbedo, pix, vec4(0.0));
+        imageStore(oND, pix, vec4(0.0, 0.0, 60000.0, 0.0));
+        imageStore(oDirect, pix, vec4(0.0)); imageStore(oIndirect, pix, vec4(0.0));
+        imageStore(oSpec, pix, vec4(min(sky, vec3(2000.0)), 1.0));
+        imageStore(oFog, pix, fg);
+        imageStore(oMotion, pix, vec4(puv - uvC, 60000.0, 0.0));
+        return;
+    }
+    Surf s = evalSurface(h, ro, rd, true);
+    vec3 P = s.P, V = -rd;
+    vec3 direct = vec3(0.0), indirect = vec3(0.0), spec = vec3(0.0), alb = s.alb;
+    float cls = 1.0; // Pixelklasse fuer den Denoiser: 1 normal, 2 Laub, 3 Vogel, 4 Wasser
+    float cs = cloudShadow(P);
+
+    if (s.id == M_WATER && !h.bird) {
+        cls = 4.0; alb = vec3(0.0);
+        vec2 p = P.xz; float e = 0.5 + h.t * 0.004, h0 = wh(p), hx = wh(p + vec2(e, 0.0)), hz = wh(p + vec2(0.0, e));
+        float amp = 0.3 * clamp(1.0 - h.t / 700.0, 0.2, 1.0);
+        vec3 N = normalize(vec3(-(hx - h0) / e * amp, 1.0, -(hz - h0) / e * amp));
+        vec3 R = reflect(rd, N); if (R.y < 0.02) { R.y = 0.02; R = normalize(R); }
+        float Fr = 0.02 + 0.98 * pow(1.0 - max(dot(V, N), 0.0), 5.0);
+        vec3 refl = F.misc3.w > 0.5 ? traceRadiance(P + vec3(0.0, 0.03, 0.0), R) : skyFull(P, R, true);
+        float vis = (gLightOn && !shadowed(P + vec3(0.0, 0.03, 0.0), gLd)) ? cs : 0.0;
+        vec3 sunIn = gLc * max(gLd.y, 0.0) * vis;
+        vec3 T = refract(rd, N, 1.0 / 1.33);
+        vec3 scat = vec3(0.012, 0.034, 0.026) * (sunIn + gAmb * 1.5);
+        vec3 under = scat * 1.6;
+        Hit hb;
+        if (trace(P - vec3(0.0, 0.03, 0.0), T, 60.0, false, 1u, hb)) {
+            Surf sb = evalSurface(hb, P, T, false);
+            vec3 ext = exp(-hb.t * vec3(0.5, 0.17, 0.24));
+            under = sb.alb * (sunIn * 0.8 + gAmb * 0.5) * ext + scat * 1.6 * (1.0 - ext);
+        }
+        spec = mix(under, refl, Fr);
+        s.N = N; s.rough = 0.05;
+    } else {
+        if (h.bird) cls = 3.0; else if (s.trans > 0.5) cls = 2.0;
+        vec3 bp = s.P + s.Ng * (0.012 + h.t * 0.0005);
+        float ndl = dot(s.N, gLd);
+        vec3 dif = vec3(max(ndl, 0.0));
+        if (s.trans > 0.0) dif = vec3(max((ndl + 0.3) / 1.3, 0.0)) + max(-ndl, 0.0) * 0.4 * s.trans * vec3(1.15, 1.25, 0.5);
+        float vis = 0.0;
+        if (gLightOn && (dif.g > 0.0)) {
+            vec3 o = s.trans > 0.0 ? s.P + gLd * 0.05 + s.Ng * 0.01 : bp;
+            vis = shadowed(o, gLd) ? 0.0 : cs;
+        }
+        direct = gLc * dif * vis;
+        float Fr = s.f0 + (1.0 - s.f0) * pow(1.0 - max(dot(V, s.N), 0.0), 5.0);
+        bool mirror = s.rough < 0.2 && s.f0 > 0.0;
+        if (mirror) {
+            vec3 R = reflect(rd, s.N);
+            vec3 j = vec3(rnd(), rnd(), rnd()) * 2.0 - 1.0;
+            R = normalize(R + j * s.rough * 0.5);
+            if (dot(R, s.Ng) < 0.02) R = normalize(R + s.Ng * (0.04 - dot(R, s.Ng)));
+            vec3 refl = F.misc3.w > 0.5 ? traceRadiance(bp, R) : skyFull(P, R, true);
+            spec += Fr * min(refl, vec3(60.0)) * s.stint;
+            alb *= (1.0 - Fr);
+        } else if (vis > 0.0 && ndl > 0.0) { // GGX-Glanzlicht der Sonne
+            vec3 Hh = normalize(V + gLd); float a = s.rough * s.rough, a2 = a * a;
+            float nh = max(dot(s.N, Hh), 0.0), dd = nh * nh * (a2 - 1.0) + 1.0, D = a2 / (PI * dd * dd);
+            float nv = max(dot(s.N, V), 1e-3), k = a * 0.5, G = 1.0 / ((ndl * (1.0 - k) + k) * (nv * (1.0 - k) + k));
+            float Fh = s.f0 + (1.0 - s.f0) * pow(1.0 - max(dot(V, Hh), 0.0), 5.0);
+            spec += gLc * PI * vis * min(D * G * Fh * 0.25 * ndl, 4.0);
+        }
+        // Global Illumination: ein Kosinus-gewichteter Strahl (bzw. mehrere bei Ultra)
+        if (max(alb.r, max(alb.g, alb.b)) < 0.03) indirect = gAmb * 0.35;
+        else {
+            int NG = int(F.misc.z);
+            for (int i = 0; i < NG; i++) {
+                vec3 d = cosDir(s.N); if (dot(d, s.Ng) < 0.0) d = reflect(d, s.Ng);
+                vec3 o = s.trans > 0.0 ? s.P + d * 0.06 : bp;
+                Hit h2; vec3 Li;
+                if (!trace(o, d, 800.0, false, 1u, h2)) Li = skyTex(d);
+                else { Surf s2 = evalSurface(h2, o, d, false); Li = shadeSimple(s2, h2.t); }
+                indirect += min(Li, vec3(40.0));
+            }
+            indirect /= float(NG);
+        }
+    }
+    vec4 fg = fogMarch(ro, rd, h.t, false, Hc);
+    vec3 Pprev = h.bird ? P - F.birdDelta.xyz : P;
+    vec2 puv = projPrev(Pprev);
+    imageStore(oAlbedo, pix, vec4(sqrt(clamp(alb, 0.0, 1.0)), cls / 255.0));
+    imageStore(oND, pix, vec4(octEnc(s.N), h.t, cls));
+    imageStore(oDirect, pix, vec4(direct, 1.0));
+    imageStore(oIndirect, pix, vec4(indirect, 1.0));
+    imageStore(oSpec, pix, vec4(spec, 1.0));
+    imageStore(oFog, pix, fg);
+    imageStore(oMotion, pix, vec4(puv - uvC, length(Pprev - F.pCamPos.xyz), 0.0));
+}

@@ -1,0 +1,21 @@
+#version 460
+// exposure.comp - automatische Belichtung (Augenadaption): geometrisches Mittel der Bildhelligkeit, zeitlich geglaettet
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 1, local_size_y = 1) in;
+#include "common.glsl"
+layout(set = 0, binding = 1) uniform sampler2D tIn;
+layout(set = 0, binding = 2, rgba16f) uniform image2D ioExp;
+void main() {
+    float s = 0.0, ws = 0.0;
+    for (int y = 0; y < 14; y++) for (int x = 0; x < 24; x++) {
+        vec2 uv = (vec2(x, y) + 0.5) / vec2(24.0, 14.0);
+        vec2 d = uv - 0.5; float w = 1.0 - 1.2 * dot(d, d); // leicht mittenbetont
+        s += log(max(luma(textureLod(tIn, uv, 0.0).rgb), 1e-6)) * w; ws += w;
+    }
+    float avg = exp(s / ws);
+    float base = F.birdDelta.w;                     // analytische Schaetzung aus dem Sonnenstand
+    float target = clamp(F.misc.y / avg, base * 0.3, base * 8.0);
+    float prev = imageLoad(ioExp, ivec2(0)).r;
+    float e = (F.misc.x < 1.5 || prev <= 0.0) ? base : mix(prev, target, clamp(F.jitter.z, 0.0, 1.0));
+    imageStore(ioExp, ivec2(0), vec4(e, avg, 0.0, 1.0));
+}

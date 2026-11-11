@@ -1,0 +1,48 @@
+#version 460
+// temporal.comp - zeitliche Akkumulation der verrauschten Beleuchtung (Reprojektion mit Tiefen-/Normalentest)
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "common.glsl"
+layout(set = 0, binding = 1) uniform sampler2D tDirect;
+layout(set = 0, binding = 2) uniform sampler2D tIndirect;
+layout(set = 0, binding = 3) uniform sampler2D tMotion;
+layout(set = 0, binding = 4) uniform sampler2D tND;
+layout(set = 0, binding = 5) uniform sampler2D tNDprev;
+layout(set = 0, binding = 6) uniform sampler2D hDirect;
+layout(set = 0, binding = 7) uniform sampler2D hIndirect;
+layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D oDirect;
+layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D oIndirect;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy); ivec2 sz = ivec2(F.res.xy);
+    if (pix.x >= sz.x || pix.y >= sz.y) return;
+    vec4 nd = texelFetch(tND, pix, 0);
+    vec3 cd = texelFetch(tDirect, pix, 0).rgb, ci = texelFetch(tIndirect, pix, 0).rgb;
+    if (nd.w < 0.5) { imageStore(oDirect, pix, vec4(0.0)); imageStore(oIndirect, pix, vec4(0.0)); return; }
+    vec3 mv = texelFetch(tMotion, pix, 0).xyz;
+    vec2 puv = (vec2(pix) + 0.5) * F.res.zw + mv.xy;
+    vec3 n = octDecF(nd.xy);
+    bool foliage = nd.w > 1.5 && nd.w < 2.5;
+    float tol = foliage ? 0.25 : 0.06;
+    vec2 fp = puv * F.res.xy - 0.5; ivec2 ip = ivec2(floor(fp)); vec2 fr = fp - vec2(ip);
+    vec4 hd = vec4(0.0), hi = vec4(0.0); float ws = 0.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 q = ip + ivec2(k & 1, k >> 1);
+        if (q.x < 0 || q.y < 0 || q.x >= sz.x || q.y >= sz.y) continue;
+        vec4 pn = texelFetch(tNDprev, q, 0);
+        if (pn.w < 0.5) continue;
+        if (abs(pn.z - mv.z) > tol * mv.z + 0.05) continue;
+        if (!foliage && dot(octDecF(pn.xy), n) < 0.85) continue;
+        float w = ((k & 1) == 1 ? fr.x : 1.0 - fr.x) * ((k >> 1) == 1 ? fr.y : 1.0 - fr.y) + 1e-4;
+        hd += texelFetch(hDirect, q, 0) * w; hi += texelFetch(hIndirect, q, 0) * w; ws += w;
+    }
+    float maxH = F.misc.w;
+    if (ws > 1e-3) {
+        hd /= ws; hi /= ws;
+        float nI = min(hi.a + 1.0, maxH), nD = min(hd.a + 1.0, min(maxH, 10.0));
+        imageStore(oDirect, pix, vec4(mix(hd.rgb, cd, 1.0 / nD), nD));
+        imageStore(oIndirect, pix, vec4(mix(hi.rgb, ci, 1.0 / nI), nI));
+    } else {
+        imageStore(oDirect, pix, vec4(cd, 1.0)); imageStore(oIndirect, pix, vec4(ci, 1.0));
+    }
+}
