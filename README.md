@@ -94,6 +94,45 @@ Unter Windows geht dasselbe in einer MSYS2-MinGW64-Shell (`glslang`, `python`, `
 | `shaders/bloom.comp`, `exposure.comp`, `final.*` | Bloom, Belichtung, Tonemapping, HUD |
 | `tools/` | Shader-Einbettung, Font-Erzeugung, Kollisionstest, Testbild-Skript |
 
+## Entstehung: die Prompts
+
+Das Spiel ist komplett im Chat mit Claude (Anthropic) entstanden. Hier stehen alle Prompts, die dafür nötig waren, wörtlich und unverändert übernommen (inklusive Tippfehlern). Die Prompts geben nur das Ziel vor. Die technischen Entscheidungen hat Claude getroffen: eigene Vulkan-Engine statt Game-Engine, Ray Queries, prozedurale Welt, Cross-Compile der .exe unter Linux und die Tests mit einem Software-Treiber.
+
+### 1. Das Spiel
+
+> Erstelle ein 3D Spiel für den PC das auf einer RTX5060TI 16GB läuft mit Raytracing läuft. Das Spiel soll folgendes können, man ist ein Vogel und kann über eine Stadt fliegen in der keine Menschen mehr Leben diese Stadt ist komplkett verlassen. Die Natur hat angfangen sich die Stadt zurück zu holen. Mit WASD soll es möglich sein den Vogel zu steuern W beschleunigen, A links, D rechts, S verlangsamen mit der Maus soll es möglich sein höher oder tiefer zu fliegen oder gar auch die richtung wechseln. Das Spiel soll ein tages nacht rythmus haben wobei man die gewünschte Tageszeit immer einstellen kann. Es soll möglich sein mit dem Vogel über die Stadt bzw. auch zwischen den Häusern zu fliegen. Die Sonne und der Mond sollen Licht mit Raytracing ausgeben. Auf der einen seite der Stadt soll noch ein Wald sein. Erstelle das Spiel mit einer sehr realistischen Grafik. Gebe den alle Datein die zu, Spiel gehören aus und eine exe mit der man das Spiel sofort auf Windows starten kann
+
+Ergebnis: die erste Version mit der C++/Vulkan-Engine (komplettes Bild per `VK_KHR_ray_query`), physikalischem Himmel, Sonnen- und Mondlicht, Global Illumination, Spiegelungen und Nebel. Dazu kamen eine prozedurale Stadt mit Ruinen und Bewuchs, der Wald im Westen, der Fluss mit eingestürzter Brücke, Flugsteuerung mit Kollision und ein Tag/Nacht-Zyklus mit einstellbarer Uhrzeit. Die Windows-.exe ist per MinGW gebaut und unter lavapipe und Wine getestet.
+
+### 2. Gebäude
+
+> Kannst du die Gebäude realistischer machen also bisschen mehr nach gebäude ausseh lassen, gerade sind das eher leblose blöcke, bisschen mehr dynamic in sachen reflektion muss rein. lass alles andere so wie es ist und ändere nur die gebäude
+
+Ergebnis:
+- **Baukörper:** L-förmig und gestaffelt.
+- **Fassadenrelief:** Lisenen, Gesimse, Fensterbänke, Balkone, Feuertreppen und Markisen.
+- **Dächer:** Satteldächer, Wassertanks, Klimageräte und Technik-Kronen.
+- **Fenster:** mit Parallaxe in die Wand gesetzt, dahinter Innenräume (Interior Mapping).
+- **Glas:** Glasfassaden spiegeln je Gebäude unterschiedlich stark und getönt, jede Scheibe ist leicht verkippt.
+
+Straßennetz, Grundstücke und Vegetation sind dabei unverändert geblieben.
+
+### 3. Vogel
+
+> mach den vogel zu einem stück anstatt in ein eckiges zusammen gesetztes modell
+
+Ergebnis: Der Vogel ist jetzt ein einziges zusammenhängendes Netz statt fünf starr gedrehter Einzelteile. Das Netz wird aus einer geglätteten Distanzfunktion erzeugt und für den Flügelschlag pro Frame an Schulter, Handgelenk und Federspitzen gebogen. Dazu kam ein neues Gefieder mit Bänderung, dunklen Flügelspitzen und gelbem Schnabel.
+
+### 4. Veröffentlichung
+
+> https://github.com/Neon153/3D-Vogelspiel
+>
+> Lade alles auf Github hoch
+
+> Füge zur Doku noch die relevanten Prompts hinzu die zum Ziel geführt haben und push es auf github
+
+Ergebnis: dieses Repository und dieser Abschnitt.
+
 ## Lizenzen der Abhängigkeiten
 
 GLFW (zlib), volk (MIT), Vulkan-Headers (Apache 2.0 / MIT), HUD-Schrift aus DejaVu Sans Mono (Bitstream-Vera-Lizenz). GLFW und volk sind statisch in die .exe gelinkt.
